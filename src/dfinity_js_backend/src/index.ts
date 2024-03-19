@@ -17,8 +17,10 @@ const Equipment = Record({
 
 const Service = Record({
     id: text,
+    serviceOwner: Opt(Principal),
     serviceType: text,
     servicePlan: text,
+    servicePrice: nat64,
     connectionSpeed: text,
     equipments: Vec(Equipment), // Modem, Router, Switch
     installationDate: text,
@@ -30,6 +32,7 @@ const Service = Record({
 
 const Customer = Record({
     id: text,
+    owner: Principal,
     fullName: text,
     emailAddress: text,
     contactNumber: text,
@@ -51,6 +54,7 @@ const EquipmentPayload = Record({
 const ServicePayload = Record({
     serviceType: text,
     servicePlan: text,
+    servicePrice: nat64,
     connectionSpeed: text,
     installationDate: text,
     technicianName: text,
@@ -69,6 +73,24 @@ const CustomerPayload = Record({
 });
 
 
+const PayStatus = Variant({
+    PaymentPending: text,
+    Completed: text
+});
+
+
+
+// Stay with implementing Payment for Reserving 
+const PayReserve = Record({
+    CustomerId: text,
+    price: nat64,
+    status: PayStatus,
+    payer: Principal,
+    paidTo: Principal,
+    paid_at_block: Opt(nat64),
+    memo: nat64
+});
+
 const Message = Variant({
     NotFound: text,
     InvalidPayload: text,
@@ -80,8 +102,17 @@ const Message = Variant({
 const equipmentStorage = StableBTreeMap(0,text, Equipment)
 const serviceStorage = StableBTreeMap(1,text, Service)
 const customerStorage = StableBTreeMap(2,text, Customer)
+const persistedPay = StableBTreeMap(3, Principal, PayReserve);
+const pendingPay = StableBTreeMap(4, nat64, PayReserve);
+
+const TIMEOUT_PERIOD = 3600n; // reservation period in seconds
 
 
+/* 
+    initialization of the Ledger canister. The principal text value is hardcoded because 
+    we set it in the `dfx.json`
+*/
+const icpCanister = Ledger(Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai"));
 
 
 export default Canister({
@@ -139,6 +170,7 @@ export default Canister({
         }
         const service = { 
             id: uuidv4(),
+            serviceOwner: Some(ic.caller()),
             equipments: [],
             ...payload};
         serviceStorage.insert(service.id, service);
@@ -152,12 +184,15 @@ export default Canister({
         }
         const customer = { 
             id: uuidv4(),
+            owner: ic.caller(),
             ...payload,
             service: {
                 id: uuidv4(),
+                serviceOwner: None,
                 equipments: [],
                 serviceType: "",
                 servicePlan: "",
+                servicePrice: 0n,
                 connectionSpeed: "",
                 installationDate: "",
                 technicianName: "",
@@ -237,10 +272,82 @@ export default Canister({
     sortCustomer: query([], Vec(Customer), () => {
         const customers = customerStorage.values();
         return customers.sort((a, b) => a.fullName.localeCompare(b.fullName));
-    })  
+    }),
+
+
+    createReservePayout: update([text], Result(PayReserve, Message), (customerId) => {
+        const customerOpt = customerStorage.get(customerId);
+        if ("None" in customerOpt) {
+            return Err({ NotFound: `cannot reserve Customer Service: Customer with id=${customerId} not found` });
+        }
+
+        const customer = customerOpt.Some;
+        const service = customer.service;
+        const payReserve = {
+            CustomerId: customerId,
+            price: service.servicePrice,
+            status: { PaymentPending: "PAYMENT_PENDING" },
+            payer: ic.caller(),
+            paidTo: service.serviceOwner.Some,
+            paid_at_block: None,
+            memo: generateCorrelationId(customerId)
+        };
+
+        pendingPay.insert(payReserve.memo, payReserve);
+        discardByTimeout(payReserve.memo, TIMEOUT_PERIOD);
+        return Ok(payReserve);
+    }
+    ),
+
+    completeReservePayment: update([Principal,text,nat64, nat64, nat64], Result(PayReserve, Message), async (reservor,customerId,reservePrice, block, memo) => {
+        const paymentVerified = await verifyPaymentInternal(reservor,reservePrice, block, memo);
+        if (!paymentVerified) {
+            return Err({ NotFound: `cannot complete the reserve: cannot verify the payment, memo=${memo}` });
+        }
+        const pendingReservePayoutOpt = pendingPay.remove(memo);
+        if ("None" in pendingReservePayoutOpt) {
+            return Err({ NotFound: `cannot complete the reserve: there is no pending reserve with id=${memo}` });
+        }
+        const reserve = pendingReservePayoutOpt.Some;
+        const updatedReserve = { ...reserve, status: { Completed: "COMPLETED" }, paid_at_block: Some(block) };
+        const customerOpt = customerStorage.get(customerId);
+        if ("None" in customerOpt){
+            throw Error(`Customer with id=${customerId} not found`)
+        }
+        const customer = customerOpt.Some;
+        const service = customer.service;
+        service.serviceOwner = Some(reservor);
+        customer.service = service;
+        customerStorage.insert(customer.id, customer);
+        persistedPay.insert(ic.caller(), updatedReserve);
+        return Ok(updatedReserve);
+
+    }
+    ),
+
+
+    verifyPayment: query([Principal, nat64, nat64, nat64], bool, async (receiver, amount, block, memo) => {
+        return await verifyPaymentInternal(receiver, amount, block, memo);
+    }),
+
+    /*
+        a helper function to get address from the principal
+        the address is later used in the transfer method
+    */
+    getAddressFromPrincipal: query([Principal], text, (principal) => {
+        return hexAddressFromPrincipal(principal, 0);
+    }),
 
 });
 
+
+/*
+    a hash function that is used to generate correlation ids for orders.
+    also, we use that in the verifyPayment function where we check if the used has actually paid the order
+*/
+function hash(input: any): nat64 {
+    return BigInt(Math.abs(hashCode().value(input)));
+};
 
 
 // a workaround to make uuid package work with Azle
@@ -258,3 +365,37 @@ globalThis.crypto = {
 };
 
 
+
+// HELPER FUNCTIONS
+function generateCorrelationId(bookId: text): nat64 {
+    const correlationId = `${bookId}_${ic.caller().toText()}_${ic.time()}`;
+    return hash(correlationId);
+};
+
+/*
+    after the order is created, we give the `delay` amount of minutes to pay for the order.
+    if it's not paid during this timeframe, the order is automatically removed from the pending orders.
+*/
+function discardByTimeout(memo: nat64, delay: Duration) {
+    ic.setTimer(delay, () => {
+        const order = pendingPay.remove(memo);
+        console.log(`Reserve discarded ${order}`);
+    });
+};
+
+async function verifyPaymentInternal(receiver: Principal, amount: nat64, block: nat64, memo: nat64): Promise<bool> {
+    const blockData = await ic.call(icpCanister.query_blocks, { args: [{ start: block, length: 1n }] });
+    const tx = blockData.blocks.find((block) => {
+        if ("None" in block.transaction.operation) {
+            return false;
+        }
+        const operation = block.transaction.operation.Some;
+        const senderAddress = binaryAddressFromPrincipal(ic.caller(), 0);
+        const receiverAddress = binaryAddressFromPrincipal(receiver, 0);
+        return block.transaction.memo === memo &&
+            hash(senderAddress) === hash(operation.Transfer?.from) &&
+            hash(receiverAddress) === hash(operation.Transfer?.to) &&
+            amount === operation.Transfer?.amount.e8s;
+    });
+    return tx ? true : false;
+};
